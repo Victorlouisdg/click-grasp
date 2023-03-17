@@ -79,7 +79,7 @@ if __name__ == "__main__":  # noqa: C901
     gripper = Robotiq2F85(ip_victor)
 
     home_joints = np.deg2rad([0, -60, -90, -120, 90, 90])
-    ur3e.move_to_joint_configuration(home_joints).wait()
+    ur3e.move_to_joint_configuration(home_joints, joint_speed=1.0).wait()
     gripper.open().wait()
 
     zed = Zed2i(resolution=Zed2i.RESOLUTION_720, fps=30)
@@ -118,7 +118,7 @@ if __name__ == "__main__":  # noqa: C901
             )
 
             grasp_pose = make_grasp_pose(points_in_world)
-            grasp_pose[2, -1] -= 0.005 # grasp at height of base
+            grasp_pose[2, -1] -= 0.009 # should be 3 mm above table
 
             pregrasp_pose = np.copy(grasp_pose)
             pregrasp_pose[2, -1] += 0.12
@@ -136,8 +136,8 @@ if __name__ == "__main__":  # noqa: C901
                 gripper.close().wait()
                 ur3e.move_linear_to_tcp_pose(pregrasp_pose).wait()
                 ur3e.move_linear_to_tcp_pose(drop_pose).wait()
-                gripper.open().wait()
-                ur3e.move_to_joint_configuration(home_joints)
+                gripper.open().wait(timeout=0.2)
+                ur3e.move_to_joint_configuration(home_joints, joint_speed=1.0)
 
                 clicked_image_points = []
 
