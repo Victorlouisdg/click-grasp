@@ -8,20 +8,10 @@ import numpy as np
 from airo_camera_toolkit.cameras.zed2i import Zed2i
 from airo_camera_toolkit.reprojection import reproject_to_frame_z_plane
 from airo_camera_toolkit.utils import ImageConverter
-from airo_robots.grippers.hardware.robotiq_2f85_tcp import Robotiq2F85
-from airo_robots.manipulators.hardware.ur_rtde import UR3E_CONFIG, UR_RTDE
-
-# from rtde_control import RTDEControlInterface
-
-
-def load_saved_calibration():
-    with open(Path(__file__).parent / "marker.pickle", "rb") as f:
-        aruco_in_camera_position, aruco_in_camera_orientation = pickle.load(f)
-    # get camera extrinsics transform
-    aruco_in_camera_transform = np.eye(4)
-    aruco_in_camera_transform[:3, :3] = aruco_in_camera_orientation
-    aruco_in_camera_transform[:3, 3] = aruco_in_camera_position
-    return aruco_in_camera_transform
+from airo_robots.grippers.hardware.robotiq_2f85_urcap import Robotiq2F85
+from airo_robots.manipulators.hardware.ur_rtde import URrtde
+from airo_dataset_tools.pose import Pose
+from airo_spatial_algebra import SE3Container
 
 
 def draw_clicked_grasp(image, clicked_image_points, current_mouse_point):
@@ -43,12 +33,13 @@ def draw_clicked_grasp(image, clicked_image_points, current_mouse_point):
     return image
 
 
-def draw_pose(image, pose, world_to_camera, camera_matrix):
-    pose_camera = world_to_camera @ pose
-    rvec = pose_camera[:3, :3]
-    tvec = pose_camera[:3, -1]
-    image = cv2.drawFrameAxes(image, camera_matrix, np.zeros(4), rvec, tvec, 0.05)
+def draw_pose(image, pose_in_base, camera_in_base, intrinsics):
+    pose_in_camera = np.linalg.inv(camera_in_base) @ pose_in_base
+    rvec = pose_in_camera[:3, :3]
+    tvec = pose_in_camera[:3, -1]
+    image = cv2.drawFrameAxes(image, intrinsics, np.zeros(4), rvec, tvec, 0.1)
     return image
+
 
 
 def make_grasp_pose(clicked_points):
@@ -69,36 +60,30 @@ def make_grasp_pose(clicked_points):
 
 
 if __name__ == "__main__":  # noqa: C901
-    if not os.path.exists(Path(__file__).parent / "marker.pickle"):
+    if not os.path.exists(Path(__file__).parent / "camera_pose.json"):
         print("Please run camera_calibration.py first.")
         sys.exit(0)
-    world_to_camera = load_saved_calibration()
 
-    ip_louise = "10.42.0.163"
-    ur3e = UR_RTDE(ip_louise, UR3E_CONFIG)
+    pose_saved = Pose.parse_file("camera_pose.json")
+    position = pose_saved.position_in_meters
+    euler_angles = pose_saved.rotation_euler_xyz_in_radians
 
-    gripper = Robotiq2F85(ip_louise)
+    position_array = np.array([position.x, position.y, position.z])
+    euler_angles_array = np.array([euler_angles.roll, euler_angles.pitch, euler_angles.yaw])
 
-    ur3e_in_world = np.identity(4)
-    ur3e_in_world[:3, -1] += [0.3, 0, 0]  # 30 cm positive along x from where the marker should be placed
-    world_to_ur3e = np.linalg.inv(ur3e_in_world)
-    # move_speed = 0.1  # m /s
+    camera_in_base = SE3Container.from_euler_angles_and_translation(euler_angles_array, position_array).homogeneous_matrix
+    
+    ip_victor = "10.42.0.162"
+    ur3e = URrtde(ip_victor, URrtde.UR3E_CONFIG)
 
-    home_ur3e = ur3e_in_world.copy()
-    home_ur3e[:3, -1] += [-0.15, -0.20, 0.2]
-    X = np.array([1, 0, 0])
-    Z = np.array([0, 0, -1])  # topdown
-    Y = np.cross(Z, X)
-    top_down = np.column_stack([X, Y, Z])
-    home_ur3e[:3, :3] = top_down
-    home_in_ur3e = world_to_ur3e @ home_ur3e
+    gripper = Robotiq2F85(ip_victor)
 
-    ur3e.move_linear_to_tcp_pose(home_in_ur3e)
-
-    gripper.open()
+    home_joints = np.deg2rad([0, -60, -90, -120, 90, 90])
+    ur3e.move_to_joint_configuration(home_joints).wait()
+    gripper.open().wait()
 
     zed = Zed2i(resolution=Zed2i.RESOLUTION_720, fps=30)
-    intrinsics_matrix = zed.intrinsics_matrix
+    intrinsics_matrix = zed.intrinsics_matrix()
 
     current_mouse_point = [(0, 0)]  # has to be a list so that the callback can edit it
     clicked_image_points = []
@@ -124,34 +109,37 @@ if __name__ == "__main__":  # noqa: C901
         image = ImageConverter(image).image_in_opencv_format
         image = draw_clicked_grasp(image, clicked_image_points, current_mouse_point)
 
-        draw_pose(image, ur3e_in_world, world_to_camera, intrinsics_matrix)
+        image = draw_pose(image, np.identity(4), camera_in_base, intrinsics_matrix)
 
         if len(clicked_image_points) == 2:
             points_in_image = np.array(clicked_image_points)
-            # points_in_world = reproject_to_frame_z_plane(points_in_image, intrinsics_matrix, world_to_camera)
             points_in_world = reproject_to_frame_z_plane(
-                points_in_image, intrinsics_matrix, np.linalg.inv(world_to_camera)
+                points_in_image, intrinsics_matrix, camera_in_base
             )
 
             grasp_pose = make_grasp_pose(points_in_world)
-            grasp_pose[2, -1] += 0.005
-            grasp_pose_in_ur3e = world_to_ur3e @ grasp_pose
+            grasp_pose[2, -1] -= 0.005 # grasp at height of base
 
             pregrasp_pose = np.copy(grasp_pose)
-            pregrasp_pose[2, -1] += 0.15  # raise grasp height by 15 cm for safety
-            pregrasp_pose_in_ur3e = world_to_ur3e @ pregrasp_pose
+            pregrasp_pose[2, -1] += 0.12
 
-            image = draw_pose(image, grasp_pose, world_to_camera, intrinsics_matrix)
-            image = draw_pose(image, pregrasp_pose, world_to_camera, intrinsics_matrix)
+            drop_pose = np.copy(pregrasp_pose)
+            drop_pose[:3, -1] = np.array([0.3, 0.25, 0.1])
+
+            image = draw_pose(image, grasp_pose, camera_in_base, intrinsics_matrix)
 
             if not grasp_executed:
                 cv2.imshow(window_name, image)  # refresh image
 
-                ur3e.move_linear_to_tcp_pose(pregrasp_pose_in_ur3e)
-                ur3e.move_linear_to_tcp_pose(grasp_pose_in_ur3e)
-                gripper.close()
-                ur3e.move_linear_to_tcp_pose(pregrasp_pose_in_ur3e)
-                grasp_executed = True
+                ur3e.move_linear_to_tcp_pose(pregrasp_pose).wait()
+                ur3e.move_linear_to_tcp_pose(grasp_pose).wait()
+                gripper.close().wait()
+                ur3e.move_linear_to_tcp_pose(pregrasp_pose).wait()
+                ur3e.move_linear_to_tcp_pose(drop_pose).wait()
+                gripper.open().wait()
+                ur3e.move_to_joint_configuration(home_joints)
+
+                clicked_image_points = []
 
         cv2.imshow(window_name, image)
         key = cv2.waitKey(10)
